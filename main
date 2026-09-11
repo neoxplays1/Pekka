@@ -1,0 +1,122 @@
+import discord
+from discord.ext import commands
+
+# ---------------- CONFIGURATION ----------------
+BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
+SOURCE_GUILD_ID = 123456789012345678  # Server A (where messages originate)
+TARGET_GUILD_ID = 987654321098765432  # Server B (where logs & channels are created)
+# -----------------------------------------------
+
+intents = discord.Intents.default()
+intents.messages = True
+intents.message_content = True  # Required in Discord Developer Portal
+intents.guilds = True
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# Cache mapping target channel ID -> discord.Webhook
+webhook_cache = {}
+
+
+async def get_or_create_category(target_guild: discord.Guild, category_name: str):
+    """Finds or creates a category in the target server."""
+    category = discord.utils.get(target_guild.categories, name=category_name)
+    if not category:
+        category = await target_guild.create_category(name=category_name)
+    return category
+
+
+async def get_or_create_target_channel(source_channel: discord.TextChannel):
+    """Finds or clones a text channel in Server B matching Server A's layout."""
+    target_guild = bot.get_guild(TARGET_GUILD_ID)
+    if not target_guild:
+        return None
+
+    # Match target category if the source channel lives in one
+    target_category = None
+    if source_channel.category:
+        target_category = await get_or_create_category(
+            target_guild, source_channel.category.name
+        )
+
+    # Search for an existing channel with the same name and category
+    target_channel = discord.utils.get(
+        target_guild.text_channels,
+        name=source_channel.name,
+        category=target_category,
+    )
+
+    if not target_channel:
+        target_channel = await target_guild.create_text_channel(
+            name=source_channel.name,
+            category=target_category,
+            topic=f"Mirrored from #{source_channel.name} ({source_channel.id})",
+        )
+
+    return target_channel
+
+
+async def get_webhook_for_channel(channel: discord.TextChannel):
+    """Fetches or creates a webhook to impersonate sender avatars and names."""
+    if channel.id in webhook_cache:
+        return webhook_cache[channel.id]
+
+    webhooks = await channel.webhooks()
+    bot_webhook = discord.utils.get(webhooks, name="LiveMirror")
+
+    if not bot_webhook:
+        bot_webhook = await channel.create_webhook(name="LiveMirror")
+
+    webhook_cache[channel.id] = bot_webhook
+    return bot_webhook
+
+
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    print("Mirroring active...")
+
+
+@bot.event
+async def on_guild_channel_create(channel):
+    """Dynamically creates a matching channel when a new one is made in Server A."""
+    if channel.guild.id != SOURCE_GUILD_ID or not isinstance(channel, discord.TextChannel):
+        return
+    await get_or_create_target_channel(channel)
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    # Ignore bot messages, DMs, and messages not from Server A
+    if message.author.bot or not message.guild or message.guild.id != SOURCE_GUILD_ID:
+        return
+
+    # Only process standard text channels
+    if not isinstance(message.channel, discord.TextChannel):
+        return
+
+    target_channel = await get_or_create_target_channel(message.channel)
+    if not target_channel:
+        return
+
+    try:
+        webhook = await get_webhook_for_channel(target_channel)
+
+        # Download and forward any file attachments (images, PDFs, etc.)
+        files = [await att.to_file() for att in message.attachments]
+
+        # Use webhook to relay message while preserving the user's name and avatar
+        await webhook.send(
+            content=message.content or None,
+            username=message.author.display_name,
+            avatar_url=message.author.display_avatar.url,
+            embeds=message.embeds,
+            files=files,
+        )
+    except Exception as e:
+        print(f"Failed to forward message {message.id}: {e}")
+
+    await bot.process_commands(message)
+
+
+bot.run(BOT_TOKEN)
